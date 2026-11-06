@@ -69,6 +69,19 @@ def initialize_database() -> None:
                 success_line INTEGER,
                 PRIMARY KEY (job_id, client_ip)
             );
+            CREATE TABLE IF NOT EXISTS entity_ledger_items (
+                job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                entity_type TEXT NOT NULL CHECK (entity_type IN ('client_ip', 'username')),
+                entity_value TEXT NOT NULL,
+                failed_login_count INTEGER NOT NULL DEFAULT 0,
+                successful_login_count INTEGER NOT NULL DEFAULT 0,
+                first_line INTEGER NOT NULL,
+                last_line INTEGER NOT NULL,
+                distinct_paths_json TEXT NOT NULL DEFAULT '[]',
+                status_counts_json TEXT NOT NULL DEFAULT '{}',
+                sensitive_path_hits INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (job_id, entity_type, entity_value)
+            );
             CREATE TABLE IF NOT EXISTS rule_findings (
                 job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
                 attack_type TEXT NOT NULL,

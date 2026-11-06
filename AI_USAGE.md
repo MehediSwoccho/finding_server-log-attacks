@@ -17,8 +17,8 @@ The output is constrained with a JSON schema containing only `findings`, whose e
 1. The initial analysis prompt was narrowed from broad anomaly detection to credible security attacks, to avoid elevating ordinary operational errors and isolated login mistakes.
 2. Untrusted-data language and explicit log delimiters were added after identifying that attacker-controlled log messages may contain prompt-like instructions.
 3. A deterministic pre-scan was added for lines containing instructions aimed at the analyzer. Those lines become `prompt_injection` findings without executing or quoting their instructions.
-4. Cross-chunk context was moved into a code-maintained per-IP ledger rather than relying on model memory. The ledger contains counts and line ranges, not model-generated conclusions.
-5. Findings are merged in application code. Evidence is unioned and severity maximized; repeated failures followed by successful authentication upgrade brute force to account compromise.
+4. Cross-chunk context was moved into a persisted code-maintained ledger keyed by client IP and username rather than relying on model memory. Its snapshots contain event facts only (login counts, lines, paths, status counts, sensitive-path hits), not attack labels or model-generated conclusions.
+5. Findings are merged in application code. Evidence is unioned and severity maximized; entity-ledger data remains factual context and the model owns attack classification.
 6. Constrained JSON output is still parsed defensively, with a repair fallback and schema-shape validation.
 
 ## Token and runtime budget
@@ -38,7 +38,7 @@ Before every call, the application counts actual prompt tokens using the loaded 
 
 - A broad “suspicious events” prompt can confuse an application bug or planned maintenance with malicious activity. The final prompt and post-processing suppress known benign classes.
 - Model output can omit, duplicate, or misformat line numbers. The schema requires evidence lines; the merger normalizes, deduplicates, and sorts integers while keeping 1-based source positions.
-- A small model may lose a sequence across chunks. The SQLite entity ledger provides cross-chunk counters and the application—not the model—performs the compromise-upgrade rule.
+- A small model may lose a sequence across chunks. Compact prior-chunk ledger snapshots provide IP- and username-linked event facts for the model's classification.
 - Model JSON can be incomplete despite constrained decoding. The repair fallback and required `findings` array check prevent malformed results from being treated as reports.
 - Log messages may attempt to change the model's task. They are treated as data, and deterministic injection findings identify explicit analyzer-directed instructions.
 

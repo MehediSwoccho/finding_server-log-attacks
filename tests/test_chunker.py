@@ -121,6 +121,64 @@ class PrepareJobChunkingTests(unittest.TestCase):
 
             self.assertEqual(chunk_count, 0)
 
+    def test_persistent_ip_and_username_ledger_feeds_later_chunk(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            events = [
+                {
+                    "client_ip": "192.0.2.44",
+                    "username": "alice",
+                    "auth_result": "failed",
+                    "path": "/api/login",
+                    "status": 401,
+                    "message": "a" * 360,
+                },
+                {
+                    "client_ip": "192.0.2.44",
+                    "username": "alice",
+                    "auth_result": "success",
+                    "path": "/reports",
+                    "status": 200,
+                    "message": "b" * 360,
+                },
+            ]
+            contents = "\n".join(json.dumps(event) for event in events) + "\n"
+            job_id, log_path, database_path = self._create_job(root, contents)
+
+            with patch.object(db, "DB_PATH", database_path):
+                db.initialize_database()
+                db.create_job(job_id, log_path.name, str(log_path))
+                self.assertEqual(prepare_job(job_id, len), 2)
+
+                # Read from fresh SQLite connections to verify persisted state.
+                with db.connect() as connection:
+                    chunks = connection.execute(
+                        "SELECT ledger_text FROM chunks WHERE job_id = ? ORDER BY chunk_index",
+                        (job_id,),
+                    ).fetchall()
+                    entities = connection.execute(
+                        "SELECT * FROM entity_ledger_items WHERE job_id = ? ORDER BY entity_type",
+                        (job_id,),
+                    ).fetchall()
+
+            self.assertEqual(chunks[0]["ledger_text"], "No prior entity facts.")
+            self.assertLessEqual(len(chunks[1]["ledger_text"]), 250)
+            self.assertIn("f=1", chunks[1]["ledger_text"])
+            self.assertIn("/api/login", chunks[1]["ledger_text"])
+            self.assertIn("username=alice", chunks[1]["ledger_text"])
+
+            self.assertEqual({row["entity_type"] for row in entities}, {"client_ip", "username"})
+            for row in entities:
+                self.assertEqual(row["failed_login_count"], 1)
+                self.assertEqual(row["successful_login_count"], 1)
+                self.assertEqual(row["first_line"], 1)
+                self.assertEqual(row["last_line"], 2)
+                self.assertEqual(row["sensitive_path_hits"], 1)
+                self.assertEqual(
+                    json.loads(row["distinct_paths_json"]), ["/api/login", "/reports"]
+                )
+                self.assertEqual(json.loads(row["status_counts_json"]), {"401": 1, "200": 1})
+
 
 if __name__ == "__main__":
     unittest.main()
