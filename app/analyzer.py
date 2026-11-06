@@ -52,6 +52,9 @@ _MODEL_LOCK = asyncio.Lock()
 _MODEL_INIT_LOCK = threading.Lock()
 _MODEL_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-llm")
 _LAST_CALL_LATENCY_MS: float | None = None
+MODEL_CALL_TIMEOUT_SECONDS = 120
+MODEL_CALL_ATTEMPTS = 3
+RETRY_BASE_SECONDS = 1.5
 
 
 def count_tokens(
@@ -568,8 +571,18 @@ def _call_model(model: Any, log_text: str, ledger_text: str) -> dict[str, Any]:
 def _insert_chunk_result(job_id: str, chunk_index: int, result: dict[str, Any], duration_ms: float) -> None:
     with db.connect() as connection:
         connection.execute(
-            "UPDATE chunks SET status = 'completed', result_json = ?, duration_ms = ?, error = NULL WHERE job_id = ? AND chunk_index = ?",
+            """UPDATE chunks SET status = 'completed', result_json = ?, duration_ms = ?,
+               call_started_at = NULL, error = NULL WHERE job_id = ? AND chunk_index = ?""",
             (json.dumps(result, ensure_ascii=False), duration_ms, job_id, chunk_index),
+        )
+
+
+def _record_chunk_failure(job_id: str, chunk_index: int, error: Exception, duration_ms: float) -> None:
+    with db.connect() as connection:
+        connection.execute(
+            """UPDATE chunks SET status = 'failed', duration_ms = ?, call_started_at = NULL,
+               error = ? WHERE job_id = ? AND chunk_index = ?""",
+            (duration_ms, str(error)[:2000], job_id, chunk_index),
         )
 
 
@@ -592,7 +605,6 @@ def _merge_report(job_id: str) -> dict[str, Any]:
             return
         attack = finding["attack_type"].lower().replace(" ", "_")
         entity = finding["entity"]
-        ip_ledger = ledger.get(entity)
         key = (entity, attack)
         current = merged.get(key)
         if current is None:
@@ -627,7 +639,7 @@ async def start_analysis(job_id: str) -> None:
                 return
             if job["status"] == "completed":
                 return
-            db.set_job(job_id, status="running", error=None)
+            db.set_job(job_id, status="running", error=None, started_at=db.now_iso())
             loop = asyncio.get_running_loop()
             model = await loop.run_in_executor(_MODEL_EXECUTOR, _load_model)
             token_counter = lambda text: count_tokens(text, model.tokenize)
@@ -642,34 +654,59 @@ async def start_analysis(job_id: str) -> None:
                         continue
                     with db.connect() as connection:
                         connection.execute(
-                            "UPDATE chunks SET status = 'running', error = NULL WHERE job_id = ? AND chunk_index = ?",
-                            (job_id, chunk["chunk_index"]),
+                            """UPDATE chunks SET status = 'running', error = NULL, duration_ms = NULL,
+                               call_started_at = ? WHERE job_id = ? AND chunk_index = ?""",
+                            (db.now_iso(), job_id, chunk["chunk_index"]),
                         )
-                    began = time.monotonic()
                     last_error: Exception | None = None
-                    for attempt in range(3):
+                    last_call_duration_ms = 0.0
+                    for attempt in range(MODEL_CALL_ATTEMPTS):
+                        call_began = time.monotonic()
+                        with db.connect() as connection:
+                            connection.execute(
+                                "UPDATE chunks SET call_started_at = ? WHERE job_id = ? AND chunk_index = ?",
+                                (db.now_iso(), job_id, chunk["chunk_index"]),
+                            )
                         try:
                             result = await asyncio.wait_for(
                                 loop.run_in_executor(
                                     _MODEL_EXECUTOR, _call_model, model, chunk["log_text"], chunk["ledger_text"]
                                 ),
-                                timeout=120,
+                                timeout=MODEL_CALL_TIMEOUT_SECONDS,
                             )
-                            duration_ms = (time.monotonic() - began) * 1000
-                            _insert_chunk_result(job_id, chunk["chunk_index"], result, duration_ms)
+                            last_call_duration_ms = (time.monotonic() - call_began) * 1000
+                            _insert_chunk_result(job_id, chunk["chunk_index"], result, last_call_duration_ms)
                             break
                         except Exception as exc:
                             last_error = exc
-                            if attempt < 2:
-                                await asyncio.sleep(1.5 * (2**attempt))
+                            last_call_duration_ms = (time.monotonic() - call_began) * 1000
+                            with db.connect() as connection:
+                                connection.execute(
+                                    "UPDATE chunks SET duration_ms = ?, call_started_at = NULL WHERE job_id = ? AND chunk_index = ?",
+                                    (last_call_duration_ms, job_id, chunk["chunk_index"]),
+                                )
+                            if attempt < MODEL_CALL_ATTEMPTS - 1:
+                                await asyncio.sleep(RETRY_BASE_SECONDS * (2**attempt))
                     else:
-                        with db.connect() as connection:
-                            connection.execute(
-                                "UPDATE chunks SET status = 'pending', error = ? WHERE job_id = ? AND chunk_index = ?",
-                                (str(last_error)[:2000], job_id, chunk["chunk_index"]),
-                            )
-                        raise RuntimeError(f"Chunk {chunk['chunk_index'] + 1} failed after retries: {last_error}") from last_error
+                        if last_error is None:
+                            last_error = RuntimeError("Model call failed without an exception")
+                        _record_chunk_failure(
+                            job_id, chunk["chunk_index"], last_error, last_call_duration_ms
+                        )
+                        # Keep processing; a later resume retries only this failed chunk.
+                        continue
             report = _merge_report(job_id)
-            db.set_job(job_id, status="completed", report_json=json.dumps(report, ensure_ascii=False), error=None)
+            with db.connect() as connection:
+                failed_count = connection.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE job_id = ? AND status = 'failed'", (job_id,)
+                ).fetchone()[0]
+            final_status = "completed_with_errors" if failed_count else "completed"
+            final_error = f"{failed_count} chunk(s) failed after retries; resume to retry them." if failed_count else None
+            db.set_job(
+                job_id,
+                status=final_status,
+                report_json=json.dumps(report, ensure_ascii=False),
+                error=final_error,
+            )
         except Exception as exc:
             db.set_job(job_id, status="failed", error=str(exc)[:2000])

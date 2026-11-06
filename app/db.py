@@ -41,6 +41,7 @@ def initialize_database() -> None:
                 total_chunks INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
                 report_json TEXT,
+                started_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -53,6 +54,7 @@ def initialize_database() -> None:
                 status TEXT NOT NULL DEFAULT 'pending',
                 result_json TEXT,
                 duration_ms REAL,
+                call_started_at TEXT,
                 error TEXT,
                 PRIMARY KEY (job_id, chunk_index)
             );
@@ -100,6 +102,8 @@ def initialize_database() -> None:
             );
             """
         )
+        _ensure_column(connection, "jobs", "started_at", "TEXT")
+        _ensure_column(connection, "chunks", "call_started_at", "TEXT")
         connection.execute(
             "UPDATE jobs SET status = 'paused', updated_at = ? WHERE status = 'running'",
             (now_iso(),),
@@ -114,6 +118,12 @@ def create_job(job_id: str, filename: str, file_path: str) -> None:
         )
 
 
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
 def get_job(job_id: str) -> sqlite3.Row | None:
     with connect() as connection:
         return connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -122,7 +132,7 @@ def get_job(job_id: str) -> sqlite3.Row | None:
 def set_job(job_id: str, **values: Any) -> None:
     if not values:
         return
-    allowed = {"status", "prepared", "total_chunks", "error", "report_json"}
+    allowed = {"status", "prepared", "total_chunks", "error", "report_json", "started_at"}
     if not set(values).issubset(allowed):
         raise ValueError("Unsupported job field")
     values["updated_at"] = now_iso()
@@ -140,24 +150,54 @@ def progress(job_id: str) -> dict[str, Any] | None:
         if job is None:
             return None
         row = connection.execute(
-            "SELECT COUNT(*) AS done FROM chunks WHERE job_id = ? AND status = 'completed'",
+            """SELECT SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS done,
+                      SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+               FROM chunks WHERE job_id = ?""",
             (job_id,),
         ).fetchone()
         active = connection.execute(
-            "SELECT chunk_index, duration_ms, status FROM chunks WHERE job_id = ? AND status IN ('running', 'completed') ORDER BY chunk_index DESC LIMIT 1",
+            """SELECT chunk_index, duration_ms, call_started_at, error, status
+               FROM chunks WHERE job_id = ? AND status = 'running'
+               ORDER BY chunk_index DESC LIMIT 1""",
             (job_id,),
         ).fetchone()
+        if active is None:
+            active = connection.execute(
+                """SELECT chunk_index, duration_ms, call_started_at, error, status
+                   FROM chunks WHERE job_id = ? AND status IN ('completed', 'failed')
+                   ORDER BY chunk_index DESC LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+        now = datetime.now(timezone.utc)
+        elapsed_seconds = _elapsed_seconds(job["started_at"], now)
+        call_elapsed_seconds = _elapsed_seconds(active["call_started_at"], now) if active else None
         return {
             "job_id": job_id,
             "filename": job["filename"],
             "status": job["status"],
             "total_chunks": job["total_chunks"],
-            "completed_chunks": row["done"],
+            "completed_chunks": row["done"] or 0,
+            "failed_chunks": row["failed"] or 0,
             "current_chunk": (active["chunk_index"] + 1) if active else None,
             "call_duration_ms": active["duration_ms"] if active else None,
+            "call_elapsed_seconds": call_elapsed_seconds,
+            "elapsed_seconds": elapsed_seconds,
+            "call_error": active["error"] if active else None,
             "error": job["error"],
             "report_available": bool(job["report_json"]),
         }
+
+
+def _elapsed_seconds(started_at: str | None, now: datetime) -> float | None:
+    if not started_at:
+        return None
+    try:
+        started = datetime.fromisoformat(started_at)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return max(0.0, round((now - started).total_seconds(), 1))
+    except (TypeError, ValueError):
+        return None
 
 
 def decode_json(value: str, default: Any) -> Any:

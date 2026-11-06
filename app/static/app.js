@@ -8,7 +8,7 @@ const progressPanel = document.querySelector('#progress-panel');
 const reportPanel = document.querySelector('#report-panel');
 let selected = null;
 let jobId = null;
-let pollTimer = null;
+let progressSource = null;
 
 function showError(element, message) {
   element.textContent = message;
@@ -17,6 +17,12 @@ function showError(element, message) {
 function clearError(element) {
   element.textContent = '';
   element.hidden = true;
+}
+function closeProgressStream() {
+  if (progressSource) {
+    progressSource.close();
+    progressSource = null;
+  }
 }
 function chooseFile(file) {
   clearError(uploadError);
@@ -69,46 +75,83 @@ startButton.addEventListener('click', async () => {
     const started = await fetch(`/jobs/${jobId}/start`, { method: 'POST' });
     const startResult = await started.json();
     if (!started.ok) throw new Error(startResult.detail?.error || 'Could not start analysis.');
-    pollTimer = window.setInterval(refreshProgress, 1000);
-    await refreshProgress();
+    connectProgressStream();
   } catch (error) {
     showError(uploadError, error.message || 'The request could not be completed.');
     startButton.disabled = false;
   }
 });
 
-async function refreshProgress() {
-  if (!jobId) return;
-  try {
-    const response = await fetch(`/jobs/${jobId}`, { cache: 'no-store' });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail?.error || 'Could not read job progress.');
-    const total = data.total_chunks || 0;
-    const done = data.completed_chunks || 0;
-    const percent = total ? Math.round((done / total) * 100) : (data.status === 'completed' ? 100 : 0);
-    document.querySelector('#progress-fill').style.width = `${percent}%`;
-    document.querySelector('#progress-percent').textContent = `${percent}%`;
-    document.querySelector('#chunk-label').textContent = total
-      ? `Chunk ${Math.min(data.current_chunk || done + 1, total)} / ${total} · ${done} complete`
-      : 'Preparing log chunks…';
-    document.querySelector('#state-label').textContent = data.status.toUpperCase();
-    document.querySelector('#ram-value').textContent = data.ram_used_mb == null ? '—' : `${data.ram_used_mb} MB`;
-    document.querySelector('#ram-total').textContent = data.ram_total_mb == null ? 'Live usage' : `of ${data.ram_total_mb} MB system RAM`;
-    document.querySelector('#timing-value').textContent = data.call_duration_ms == null ? '—' : `${(data.call_duration_ms / 1000).toFixed(1)} s`;
-    if (data.status === 'failed') {
-      showError(document.querySelector('#job-error'), `${data.error || 'Analysis failed.'} You can press Analyze log again to resume this checkpoint.`);
-      window.clearInterval(pollTimer);
+function applyProgress(data) {
+  const total = data.total_chunks || 0;
+  const done = data.completed_chunks || 0;
+  const failed = data.failed_chunks || 0;
+  const finished = done + failed;
+  const terminal = ['completed', 'completed_with_errors'].includes(data.status);
+  const percent = total ? Math.round(((terminal ? finished : done) / total) * 100) : (terminal ? 100 : 0);
+  document.querySelector('#progress-fill').style.width = `${percent}%`;
+  document.querySelector('#progress-percent').textContent = `${percent}%`;
+  const current = Math.min(data.current_chunk || finished + 1, total);
+  const elapsed = data.elapsed_seconds == null ? '' : ` · ${data.elapsed_seconds.toFixed(1)}s elapsed`;
+  document.querySelector('#chunk-label').textContent = total
+    ? `Chunk ${current} / ${total} · ${done} complete${failed ? ` · ${failed} failed` : ''}${elapsed}`
+    : 'Preparing log chunks…';
+  document.querySelector('#state-label').textContent = data.status.toUpperCase().replaceAll('_', ' ');
+  document.querySelector('#ram-value').textContent = data.ram_used_mb == null ? '—' : `${data.ram_used_mb} MB`;
+  document.querySelector('#ram-total').textContent = data.ram_total_mb == null ? 'Live usage' : `of ${data.ram_total_mb} MB system RAM`;
+  const callSeconds = data.call_elapsed_seconds != null
+    ? data.call_elapsed_seconds
+    : (data.call_duration_ms == null ? null : data.call_duration_ms / 1000);
+  document.querySelector('#timing-value').textContent = callSeconds == null ? '—' : `${callSeconds.toFixed(1)} s`;
+
+  if (data.status === 'failed') {
+    closeProgressStream();
+    showError(document.querySelector('#job-error'), `${data.error || 'Analysis failed.'} Resume to retry unfinished work.`);
+    startButton.disabled = false;
+    startButton.textContent = 'Resume analysis ↗';
+  } else if (terminal) {
+    closeProgressStream();
+    if (data.status === 'completed_with_errors') {
+      showError(document.querySelector('#job-error'), `${data.error || `${failed} chunk(s) failed.`} Completed findings are available; resume to retry failed chunks.`);
       startButton.disabled = false;
-      startButton.textContent = 'Resume analysis ↗';
-    } else if (data.status === 'completed') {
-      window.clearInterval(pollTimer);
+      startButton.textContent = 'Retry failed chunks ↗';
+    } else {
+      clearError(document.querySelector('#job-error'));
       startButton.disabled = true;
       startButton.textContent = 'Analysis complete';
-      await showReport();
     }
-  } catch (error) {
-    showError(document.querySelector('#job-error'), error.message || 'Progress check failed.');
+    if (data.report_available) showReport().catch(error => showError(document.querySelector('#job-error'), error.message));
+  } else if (data.status === 'paused') {
+    closeProgressStream();
+    startButton.disabled = false;
+    startButton.textContent = 'Resume analysis ↗';
   }
+}
+
+function connectProgressStream() {
+  closeProgressStream();
+  progressSource = new EventSource(`/api/jobs/${jobId}/progress`);
+  progressSource.addEventListener('progress', event => {
+    try {
+      applyProgress(JSON.parse(event.data));
+    } catch (error) {
+      showError(document.querySelector('#job-error'), `Could not read progress event: ${error.message}`);
+    }
+  });
+  progressSource.onerror = () => {
+    if (progressSource?.readyState === EventSource.CLOSED) {
+      showError(document.querySelector('#job-error'), 'Progress stream disconnected. Resume analysis to reconnect.');
+      startButton.disabled = false;
+      startButton.textContent = 'Resume analysis ↗';
+    }
+  };
+}
+
+async function loadProgressOnce() {
+  const response = await fetch(`/jobs/${jobId}`, { cache: 'no-store' });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.detail?.error || 'Could not read job progress.');
+  applyProgress(data);
 }
 
 async function showReport() {
@@ -159,18 +202,15 @@ async function restoreLastJob() {
     const data = await response.json();
     progressPanel.hidden = false;
     document.querySelector('#checkpoint-value').textContent = `…${jobId.slice(-7)}`;
-    if (data.status === 'completed') {
-      await refreshProgress();
-    } else if (data.status === 'running') {
-      pollTimer = window.setInterval(refreshProgress, 1000);
-      await refreshProgress();
+    if (data.status === 'running') {
+      connectProgressStream();
     } else {
       startButton.disabled = false;
-      startButton.textContent = 'Resume analysis ↗';
+      startButton.textContent = data.status === 'completed_with_errors' ? 'Retry failed chunks ↗' : 'Resume analysis ↗';
       if (data.status === 'failed') {
         showError(document.querySelector('#job-error'), `${data.error || 'Analysis failed.'} Resume to retry unfinished chunks.`);
       }
-      await refreshProgress();
+      await loadProgressOnce();
     }
   } catch (_) {
     localStorage.removeItem('securityAnalyzerJobId');
