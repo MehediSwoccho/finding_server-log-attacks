@@ -1,0 +1,6 @@
+.security_analyzer/
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+models/*.gguf
