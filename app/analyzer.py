@@ -90,28 +90,56 @@ def count_tokens(
         return len(tokenizer(encoded))
 
 
+class EntryChunker:
+    """Incrementally pack complete log entries under a token limit."""
+
+    def __init__(self, token_counter: Callable[[str], int], max_tokens: int = MAX_LOG_TOKENS) -> None:
+        self._token_counter = token_counter
+        self._max_tokens = max_tokens
+        self._pending: list[str] = []
+        self._pending_tokens = 0
+
+    def add(self, line_number: int, entry: str) -> tuple[str, int] | None:
+        single_count = self._token_counter(entry)
+        if single_count > self._max_tokens:
+            raise ValueError(
+                f"Log entry on line {line_number} is {single_count} tokens; "
+                f"the per-chunk limit is {self._max_tokens} and entries cannot be split."
+            )
+        candidate = "\n".join((*self._pending, entry))
+        candidate_count = self._token_counter(candidate)
+        if self._pending and candidate_count > self._max_tokens:
+            completed = ("\n".join(self._pending), self._pending_tokens)
+            self._pending = [entry]
+            self._pending_tokens = single_count
+            return completed
+        self._pending.append(entry)
+        self._pending_tokens = candidate_count
+        return None
+
+    def finish(self) -> tuple[str, int] | None:
+        if not self._pending:
+            return None
+        completed = ("\n".join(self._pending), self._pending_tokens)
+        self._pending = []
+        self._pending_tokens = 0
+        return completed
+
+
 def chunk_entries(
     entries: Iterable[tuple[int, str]],
     token_counter: Callable[[str], int],
     max_tokens: int = MAX_LOG_TOKENS,
 ) -> Iterator[tuple[str, int]]:
-    """Pack whole, line-numbered entries without splitting any entry."""
-    pending: list[str] = []
+    """Pack whole, line-numbered entries using the production chunk builder."""
+    chunker = EntryChunker(token_counter, max_tokens)
     for line_number, entry in entries:
-        single_count = token_counter(entry)
-        if single_count > max_tokens:
-            raise ValueError(f"Log entry on line {line_number} is {single_count} tokens; the per-chunk limit is {max_tokens} and entries cannot be split.")
-        candidate = "\n".join((*pending, entry))
-        candidate_count = token_counter(candidate)
-        if pending and candidate_count > max_tokens:
-            packed = "\n".join(pending)
-            yield packed, token_counter(packed)
-            pending = [entry]
-        else:
-            pending.append(entry)
-    if pending:
-        packed = "\n".join(pending)
-        yield packed, token_counter(packed)
+        completed = chunker.add(line_number, entry)
+        if completed is not None:
+            yield completed
+    completed = chunker.finish()
+    if completed is not None:
+        yield completed
 
 
 def _normalize_field_name(name: str) -> str:
@@ -241,15 +269,13 @@ def _flush_chunk(
     connection: sqlite3.Connection,
     job_id: str,
     index: int,
-    entries: list[str],
+    log_text: str,
+    token_count: int,
     token_counter: Callable[[str], int],
 ) -> None:
-    if not entries:
-        return
-    text = "\n".join(entries)
     connection.execute(
         "INSERT INTO chunks(job_id, chunk_index, log_text, ledger_text, token_count, status) VALUES (?, ?, ?, ?, ?, 'pending')",
-        (job_id, index, text, _ledger_snapshot(connection, job_id, token_counter), token_counter(text)),
+        (job_id, index, log_text, _ledger_snapshot(connection, job_id, token_counter), token_count),
     )
 
 
@@ -272,7 +298,7 @@ def prepare_job(job_id: str, token_counter: Callable[[str], int]) -> int:
         connection.execute("DELETE FROM entity_ledger WHERE job_id = ?", (job_id,))
         connection.execute("DELETE FROM rule_findings WHERE job_id = ?", (job_id,))
         connection.execute("DELETE FROM benign_lines WHERE job_id = ?", (job_id,))
-        pending: list[str] = []
+        chunker = EntryChunker(token_counter, MAX_LOG_TOKENS)
         chunk_index = 0
         with file_path.open("r", encoding="utf-8", errors="replace") as source:
             for line_number, raw in enumerate(source, start=1):
@@ -280,17 +306,10 @@ def prepare_job(job_id: str, token_counter: Callable[[str], int]) -> int:
                 if not raw_line.strip():
                     continue
                 fields, rendered = parse_log_line(raw_line, line_number)
-                one_count = token_counter(rendered)
-                if one_count > MAX_LOG_TOKENS:
-                    raise ValueError(
-                        f"Log entry on line {line_number} uses {one_count} tokens; the {MAX_LOG_TOKENS}-token chunk limit cannot split an entry."
-                    )
-                candidate = "\n".join((*pending, rendered))
-                if pending and token_counter(candidate) > MAX_LOG_TOKENS:
-                    _flush_chunk(connection, job_id, chunk_index, pending, token_counter)
+                completed = chunker.add(line_number, rendered)
+                if completed is not None:
+                    _flush_chunk(connection, job_id, chunk_index, completed[0], completed[1], token_counter)
                     chunk_index += 1
-                    pending = []
-                pending.append(rendered)
                 _record_entity(connection, job_id, line_number, fields)
                 if _is_prompt_injection(raw_line):
                     entity = str(fields.get("client_ip") or f"line:{line_number}")
@@ -307,7 +326,9 @@ def prepare_job(job_id: str, token_counter: Callable[[str], int]) -> int:
                     connection.execute(
                         "INSERT OR REPLACE INTO benign_lines VALUES (?, ?, ?)", (job_id, line_number, benign)
                     )
-        _flush_chunk(connection, job_id, chunk_index, pending, token_counter)
+        completed = chunker.finish()
+        if completed is not None:
+            _flush_chunk(connection, job_id, chunk_index, completed[0], completed[1], token_counter)
         total = connection.execute("SELECT COUNT(*) FROM chunks WHERE job_id = ?", (job_id,)).fetchone()[0]
         connection.execute(
             "UPDATE jobs SET prepared = 1, total_chunks = ?, updated_at = ? WHERE id = ?",
@@ -445,13 +466,15 @@ def _call_model_impl(model: Any, log_text: str, ledger_text: str) -> dict[str, A
     log_tokens = count_tokens(log_text, model.tokenize)
     ledger_tokens = count_tokens(ledger_text, model.tokenize)
     allocated = system_tokens + log_tokens + ledger_tokens + OUTPUT_TOKEN_RESERVE
+    configured_budget = SYSTEM_TOKEN_BUDGET + MAX_LOG_TOKENS + MAX_LEDGER_TOKENS + OUTPUT_TOKEN_RESERVE
     if system_tokens > SYSTEM_TOKEN_BUDGET or log_tokens > MAX_LOG_TOKENS or ledger_tokens > MAX_LEDGER_TOKENS:
         raise RuntimeError("Prompt section exceeded its token allocation; refusing to call the model.")
-    if allocated >= MODEL_CONTEXT or prompt_tokens + OUTPUT_TOKEN_RESERVE >= MODEL_CONTEXT:
+    if configured_budget >= MODEL_CONTEXT or allocated >= MODEL_CONTEXT or prompt_tokens + OUTPUT_TOKEN_RESERVE >= MODEL_CONTEXT:
         raise RuntimeError(
             f"Prompt budget would exceed the {MODEL_CONTEXT}-token context (prompt={prompt_tokens}, output reserve={OUTPUT_TOKEN_RESERVE})."
         )
     # Keep an explicit invariant immediately before every inference call.
+    assert configured_budget < MODEL_CONTEXT
     assert allocated < MODEL_CONTEXT and prompt_tokens + OUTPUT_TOKEN_RESERVE < MODEL_CONTEXT
     response = model.create_chat_completion(
         messages=messages,

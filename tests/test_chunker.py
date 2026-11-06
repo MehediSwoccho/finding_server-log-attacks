@@ -1,8 +1,11 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-from app import analyzer
-from app.analyzer import chunk_entries
+from app import analyzer, db
+from app.analyzer import chunk_entries, parse_log_line, prepare_job
 
 
 class ChunkEntriesTests(unittest.TestCase):
@@ -29,6 +32,94 @@ class ChunkEntriesTests(unittest.TestCase):
 
     def test_empty_input_has_no_chunks(self):
         self.assertEqual(list(chunk_entries([], len, max_tokens=10)), [])
+
+
+class LogParsingTests(unittest.TestCase):
+    def test_malformed_json_falls_back_to_raw_text_and_keeps_source_line(self):
+        raw_line = '{"message": not valid json'
+        fields, rendered = parse_log_line(raw_line, 17)
+
+        self.assertEqual(fields, {"message": raw_line})
+        decoded = json.loads(rendered)
+        self.assertEqual(decoded["line"], 17)
+        self.assertEqual(decoded["data"]["message"], raw_line)
+
+    def test_compact_json_drops_noise_and_only_browser_user_agent(self):
+        raw_line = json.dumps({
+            "time": "2026-11-07T10:00:00Z",
+            "ip": "192.0.2.5",
+            "method": "GET",
+            "path": "/admin",
+            "status": 403,
+            "username": "alice",
+            "auth_result": "denied",
+            "message": "blocked",
+            "security_rule": "access_denied",
+            "user_agent": "curl/8.7.1",
+            "host": "noisy.example",
+            "response_bytes": 8192,
+        })
+        fields, rendered = parse_log_line(raw_line, 9)
+
+        self.assertEqual(fields["client_ip"], "192.0.2.5")
+        self.assertEqual(fields["user_agent"], "curl/8.7.1")
+        self.assertNotIn("host", fields)
+        self.assertNotIn("response_bytes", fields)
+        self.assertIn('"line":9', rendered)
+
+        browser_fields, _ = parse_log_line(
+            '{"user_agent":"Mozilla/5.0 Chrome/130.0.0.0","message":"ok"}', 10
+        )
+        self.assertNotIn("user_agent", browser_fields)
+
+
+class PrepareJobChunkingTests(unittest.TestCase):
+    def _create_job(self, root: Path, contents: str) -> tuple[str, Path, Path]:
+        job_id = "test-job"
+        log_path = root / "input.log"
+        log_path.write_text(contents, encoding="utf-8")
+        return job_id, log_path, root / "checkpoints.sqlite3"
+
+    def test_production_chunking_keeps_entries_whole_and_line_numbered(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            contents = (
+                json.dumps({"message": "a" * 450}) + "\n" +
+                json.dumps({"message": "b" * 450}) + "\n"
+            )
+            job_id, log_path, database_path = self._create_job(root, contents)
+
+            with patch.object(db, "DB_PATH", database_path):
+                db.initialize_database()
+                db.create_job(job_id, log_path.name, str(log_path))
+                self.assertEqual(prepare_job(job_id, len), 2)
+                with db.connect() as connection:
+                    chunks = connection.execute(
+                        "SELECT log_text, token_count FROM chunks WHERE job_id = ? ORDER BY chunk_index",
+                        (job_id,),
+                    ).fetchall()
+
+            self.assertIn('"line":1', chunks[0]["log_text"])
+            self.assertNotIn('"line":2', chunks[0]["log_text"])
+            self.assertIn('"line":2', chunks[1]["log_text"])
+            self.assertTrue(all(chunk["token_count"] <= 900 for chunk in chunks))
+
+    def test_production_rejects_oversized_single_source_line(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            job_id, log_path, database_path = self._create_job(root, "x" * 1000 + "\n")
+
+            with patch.object(db, "DB_PATH", database_path):
+                db.initialize_database()
+                db.create_job(job_id, log_path.name, str(log_path))
+                with self.assertRaisesRegex(ValueError, "line 1"):
+                    prepare_job(job_id, len)
+                with db.connect() as connection:
+                    chunk_count = connection.execute(
+                        "SELECT COUNT(*) FROM chunks WHERE job_id = ?", (job_id,)
+                    ).fetchone()[0]
+
+            self.assertEqual(chunk_count, 0)
 
 
 if __name__ == "__main__":
