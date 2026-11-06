@@ -3,7 +3,7 @@
 ## Development tools
 
 - GitHub Copilot was used as the coding assistant to scaffold the FastAPI service, SQLite checkpoint flow, chunking/parsing helpers, small browser UI, tests, and documentation.
-- The application uses a locally installed `llama-cpp-python` runtime and a user-supplied Qwen3.5 Q4 GGUF. There are no hosted-model SDKs, telemetry calls, or cloud inference endpoints in the runtime path.
+- The application uses a locally installed `llama-cpp-python` runtime and a local Qwen3.5 Q4 GGUF. `scripts/download_model.py` contacts the Hugging Face model-file host only when explicitly run for setup; there are no hosted-model inference SDKs, telemetry calls, or cloud inference endpoints in the application runtime.
 - `json-repair` is used only as a local fallback for malformed model JSON.
 
 ## Key local-model prompt

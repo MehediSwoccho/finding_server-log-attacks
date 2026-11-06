@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import sqlite3
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -70,11 +71,18 @@ FIELD_ALIASES = {
 
 _MODEL: Any = None
 _MODEL_LOCK = asyncio.Lock()
+_MODEL_INIT_LOCK = threading.Lock()
 _MODEL_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-llm")
+_LAST_CALL_LATENCY_MS: float | None = None
 
 
-def count_tokens(text: str, tokenizer: Callable[[bytes], list[int]]) -> int:
+def count_tokens(
+    text: str,
+    tokenizer: Callable[..., list[int]] | None = None,
+) -> int:
     """Count with llama-cpp's tokenizer (special tokens included)."""
+    if tokenizer is None:
+        tokenizer = _load_model().tokenize
     encoded = text.encode("utf-8")
     try:
         return len(tokenizer(encoded, add_bos=False, special=True))
@@ -317,22 +325,38 @@ def prepare_job(job_id: str, token_counter: Callable[[str], int]) -> int:
 def _load_model() -> Any:
     global _MODEL
     if _MODEL is None:
-        if not MODEL_PATH.is_file():
-            raise FileNotFoundError(f"Local GGUF model not found at {MODEL_PATH}. Set LOCAL_MODEL_PATH to a downloaded Qwen3.5 Q4 GGUF file.")
-        try:
-            from llama_cpp import Llama
-        except ImportError as exc:
-            raise RuntimeError("llama-cpp-python is not installed. Install the project requirements first.") from exc
-        _MODEL = Llama(
-            model_path=str(MODEL_PATH),
-            n_ctx=MODEL_CONTEXT,
-            n_threads=2,
-            n_gpu_layers=0,
-            n_batch=64,
-            use_mmap=True,
-            verbose=False,
-        )
+        with _MODEL_INIT_LOCK:
+            if _MODEL is None:
+                if not MODEL_PATH.is_file():
+                    raise FileNotFoundError(
+                        f"Local GGUF model not found at {MODEL_PATH}. Run scripts/download_model.py or set LOCAL_MODEL_PATH."
+                    )
+                try:
+                    from llama_cpp import Llama
+                except ImportError as exc:
+                    raise RuntimeError("llama-cpp-python is not installed. Install the project requirements first.") from exc
+                _MODEL = Llama(
+                    model_path=str(MODEL_PATH),
+                    n_ctx=MODEL_CONTEXT,
+                    n_threads=2,
+                    n_gpu_layers=0,
+                    n_batch=64,
+                    use_mmap=True,
+                    verbose=False,
+                )
     return _MODEL
+
+
+async def load_model_once() -> None:
+    """Load the local model during application startup, outside the event loop."""
+    async with _MODEL_LOCK:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(_MODEL_EXECUTOR, _load_model)
+
+
+def last_call_latency_ms() -> float | None:
+    """Return the elapsed time for the most recent model call, if any."""
+    return _LAST_CALL_LATENCY_MS
 
 
 def repair_json_response(raw: str) -> dict[str, Any]:
@@ -415,7 +439,7 @@ def _render_prompt(model: Any, log_text: str, ledger_text: str) -> tuple[list[di
     return messages, prompt_tokens
 
 
-def _call_model(model: Any, log_text: str, ledger_text: str) -> dict[str, Any]:
+def _call_model_impl(model: Any, log_text: str, ledger_text: str) -> dict[str, Any]:
     messages, prompt_tokens = _render_prompt(model, log_text, ledger_text)
     system_tokens = count_tokens(SYSTEM_PROMPT, model.tokenize)
     log_tokens = count_tokens(log_text, model.tokenize)
@@ -439,6 +463,15 @@ def _call_model(model: Any, log_text: str, ledger_text: str) -> dict[str, Any]:
     )
     content = response["choices"][0]["message"].get("content", "")
     return {"findings": _normalize_findings(repair_json_response(str(content)))}
+
+
+def _call_model(model: Any, log_text: str, ledger_text: str) -> dict[str, Any]:
+    global _LAST_CALL_LATENCY_MS
+    began = time.perf_counter()
+    try:
+        return _call_model_impl(model, log_text, ledger_text)
+    finally:
+        _LAST_CALL_LATENCY_MS = (time.perf_counter() - began) * 1000
 
 
 def _insert_chunk_result(job_id: str, chunk_index: int, result: dict[str, Any], duration_ms: float) -> None:

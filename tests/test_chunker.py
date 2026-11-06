@@ -1,9 +1,20 @@
 import unittest
+from unittest.mock import patch
 
+from app import analyzer
 from app.analyzer import chunk_entries
 
 
 class ChunkEntriesTests(unittest.TestCase):
+    def test_public_count_tokens_uses_loaded_model_tokenizer(self):
+        class FakeModel:
+            @staticmethod
+            def tokenize(value, **_kwargs):
+                return list(value)
+
+        with patch.object(analyzer, "_MODEL", FakeModel()):
+            self.assertEqual(analyzer.count_tokens("local"), 5)
+
     def test_packs_whole_entries_and_preserves_line_numbers(self):
         entries = [(1, '{"line":1}'), (2, '{"line":2}'), (3, '{"line":3}')]
         chunks = list(chunk_entries(entries, lambda value: len(value), max_tokens=22))

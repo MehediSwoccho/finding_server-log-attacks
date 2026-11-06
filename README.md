@@ -4,7 +4,7 @@ A small, local-only FastAPI app for triaging `.log` / `.txt` files with a CPU GG
 
 ## Hardware and model
 
-Designed for **4 GB RAM, 2 vCPU, no GPU**. The default recommendation is a **Qwen3.5 0.8B Q4 GGUF**; the supported alternative is a Qwen3.5 2B Q4 GGUF if its runtime memory fits your system. Point `LOCAL_MODEL_PATH` at the local model file. This project does not download weights. The model's GGUF must include a chat template supported by the installed llama.cpp version.
+Designed for **4 GB RAM, 2 vCPU, no GPU**. The default model is the **Qwen3.5 2B Q4_K_M GGUF** from [Unsloth's Hugging Face repository](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF) (about 1.28 GB). An alternate repository/file can be selected with environment settings below. The 0.8B Q4 model is an option for tighter memory budgets. The model's GGUF must be supported by the installed llama.cpp version.
 
 Runtime settings are deliberately constrained: llama.cpp context 2,048, 2 CPU threads, no GPU layers, mmap enabled, and a 64-token batch. Keep other applications modest on 4 GB machines. Quantization variants and llama.cpp versions can differ in memory use and chat-template support.
 
@@ -25,26 +25,43 @@ Runtime settings are deliberately constrained: llama.cpp context 2,048, 2 CPU th
    pip install -r requirements.txt
    ```
 
-4. Place a compatible Qwen3.5 Q4 GGUF locally, then set the model path (absolute path recommended):
+4. Download the default model once (requires an internet connection for this setup step only):
 
    ```powershell
-   $env:LOCAL_MODEL_PATH = "D:\models\Qwen3.5-0.8B-Q4_K_M.gguf"
+   python scripts/download_model.py
    ```
 
-5. Start the server:
+   This downloads `Qwen3.5-2B-Q4_K_M.gguf` into `models/`; it skips the download if the target file already exists. The app does not download models on startup. To select a different repository/file/path, set the environment variables below before running the script and server.
+
+5. Start the server. Startup loads the selected model once; the server reports a clear startup error if it is missing or incompatible:
 
    ```powershell
    uvicorn app.main:app --host 127.0.0.1 --port 8000
    ```
 
-6. Open `http://127.0.0.1:8000`. Keep the server bound to localhost unless access from another machine is explicitly desired. To work offline after setup, stage Python wheels/dependencies and the GGUF before disconnecting; the running app itself makes no external model or API requests.
+6. Open `http://127.0.0.1:8000`. Keep the server bound to localhost unless access from another machine is explicitly desired. The downloader contacts Hugging Face only when explicitly run; inference and app runtime are local and do not call cloud inference APIs. To work offline after setup, stage Python wheels/dependencies and the GGUF before disconnecting.
 
 Optional environment settings:
 
-- `LOCAL_MODEL_PATH`: GGUF path (default: `models/Qwen3.5-0.8B-Q4_K_M.gguf` in the project directory).
+- `MODEL_REPO_ID`: Hugging Face repository for setup-time downloads (default `unsloth/Qwen3.5-2B-GGUF`).
+- `MODEL_FILENAME`: GGUF filename in that repository (default `Qwen3.5-2B-Q4_K_M.gguf`).
+- `MODEL_REVISION`: repository branch, tag, or commit (default `main`; pin a commit for reproducible downloads).
+- `MODEL_DIR`: model download directory (default `models/`).
+- `LOCAL_MODEL_PATH`: exact local GGUF path used by the app; when set, its basename is the default download filename unless `MODEL_FILENAME` is also set.
 - `ANALYZER_DATA_DIR`: directory for uploads and the SQLite database (default `.security_analyzer/`).
 - `ANALYZER_DB_PATH`: override the SQLite file path.
 - `MAX_UPLOAD_MB`: upload limit in MiB (default 25).
+
+For example, select another public GGUF repository before downloading and launching:
+
+```powershell
+$env:MODEL_REPO_ID = "owner/model-GGUF"
+$env:MODEL_FILENAME = "model-Q4_K_M.gguf"
+$env:MODEL_REVISION = "main"
+$env:LOCAL_MODEL_PATH = "$PWD/models/model-Q4_K_M.gguf"
+python scripts/download_model.py
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
 
 ## How processing works
 
@@ -63,6 +80,7 @@ Optional environment settings:
 - `GET /jobs/{job_id}` — progress, last call duration, process RAM, and errors.
 - `GET /jobs/{job_id}/report` — final merged findings.
 - `GET /health` — local service health.
+- `GET /api/health` — loaded model name, process RSS in MB, and most recent model-call latency in milliseconds (`null` before the first call).
 
 Upload errors use JSON `detail.error` messages. The UI presents these messages, per-call timing, process memory, progress, severity badges, and evidence lines.
 
@@ -81,6 +99,6 @@ Tests cover whole-entry chunk packing, original line references, oversized entri
 - Detection is a triage aid, not a SIEM, incident-response system, or guarantee of attack detection. Validate high-impact findings against source systems.
 - Input is line-oriented JSONL or plain text; deeply nested JSON fields are intentionally not expanded, and only the documented common aliases are normalized.
 - A single rendered event exceeding 900 tokens cannot be split safely and causes preparation to fail with its source line number.
-- The 0.8B model has limited reasoning capability; small CPU models can miss subtle attacks or produce false positives. Heuristics explicitly suppress common benign operational events and single login typos, but cannot eliminate every error.
+- Small CPU models can miss subtle attacks or produce false positives. The 2B Q4 model uses more memory than the 0.8B alternative; actual RAM use varies with the llama.cpp build and workload. Heuristics explicitly suppress common benign operational events and single login typos, but cannot eliminate every error.
 - Checkpoints and uploaded logs are stored locally without encryption. Protect the data directory and remove it when no longer needed. There is no authentication or multi-user isolation; bind to localhost.
 - GGUF chat-template and Qwen3.5 support depends on the selected llama.cpp/llama-cpp-python release and model conversion. Verify the chosen model on this machine before processing sensitive production logs.

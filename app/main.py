@@ -9,9 +9,10 @@ from typing import Any
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+import psutil
 
 from . import analyzer, db
-from .config import MAX_UPLOAD_BYTES, UPLOAD_DIR
+from .config import MAX_UPLOAD_BYTES, MODEL_PATH, UPLOAD_DIR
 
 app = FastAPI(title="Local AI Security Log Analyzer", version="1.0.0")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
@@ -19,8 +20,9 @@ _active_tasks: dict[str, asyncio.Task[None]] = {}
 
 
 @app.on_event("startup")
-def startup() -> None:
+async def startup() -> None:
     db.initialize_database()
+    await analyzer.load_model_once()
 
 
 @app.get("/")
@@ -108,3 +110,14 @@ def get_report(job_id: str) -> dict[str, Any]:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "mode": "local-only"}
+
+
+@app.get("/api/health")
+def api_health() -> dict[str, Any]:
+    process = psutil.Process(os.getpid())
+    return {
+        "model_name": MODEL_PATH.stem,
+        "model_loaded": True,
+        "rss_memory_mb": round(process.memory_info().rss / (1024 * 1024), 1),
+        "last_call_latency_ms": analyzer.last_call_latency_ms(),
+    }
