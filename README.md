@@ -4,7 +4,7 @@ A small, local-only FastAPI app for triaging `.log` / `.txt` files with a CPU GG
 
 ## Hardware and model
 
-Designed for **4 GB RAM, 2 vCPU, no GPU**. The default model is the **Qwen3.5 2B Q4_K_M GGUF** from [Unsloth's Hugging Face repository](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF) (about 1.28 GB). An alternate repository/file can be selected with environment settings below. The 0.8B Q4 model is an option for tighter memory budgets. The model's GGUF must be supported by the installed llama.cpp version.
+Designed for **4 GB RAM, 2 vCPU, no GPU**. The default model is **Qwen3.5 2B Q4_K_M GGUF**, `Qwen3.5-2B-Q4_K_M.gguf`, from [Unsloth's Hugging Face repository](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF). The downloaded file is 1,280,835,840 bytes (1.28 GB decimal, about 1.19 GiB). Alternate repositories/files can be selected with environment settings below. A compatible 0.8B Q4 GGUF can be used for tighter memory limits. The selected GGUF and its chat template must be supported by the installed llama.cpp version.
 
 Runtime settings are deliberately constrained: llama.cpp context 2,048, 2 CPU threads, no GPU layers, mmap enabled, and a 64-token batch. Keep other applications modest on 4 GB machines. Quantization variants and llama.cpp versions can differ in memory use and chat-template support.
 
@@ -18,12 +18,14 @@ Runtime settings are deliberately constrained: llama.cpp context 2,048, 2 CPU th
    .\.venv\Scripts\Activate.ps1
    ```
 
-3. Install dependencies. On Windows, `llama-cpp-python` may need a local CPU build toolchain; CUDA is not used:
+3. Install dependencies. Prefer the upstream CPU wheel index on Windows to avoid a native compiler build. If no compatible wheel is available, install Visual Studio C++ Build Tools and CMake and build for CPU (CUDA is not used):
 
    ```powershell
-   $env:CMAKE_ARGS = "-DGGML_CUDA=OFF"
-   pip install -r requirements.txt
+   pip install fastapi 'uvicorn[standard]' python-multipart psutil json-repair huggingface-hub
+   pip install --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu 'llama-cpp-python>=0.3.36'
    ```
+
+   For a source build, run `$env:CMAKE_ARGS = "-DGGML_CUDA=OFF"` before `pip install -r requirements.txt`.
 
 4. Download the default model once (requires an internet connection for this setup step only):
 
@@ -40,6 +42,26 @@ Runtime settings are deliberately constrained: llama.cpp context 2,048, 2 CPU th
    ```
 
 6. Open `http://127.0.0.1:8000`. Keep the server bound to localhost unless access from another machine is explicitly desired. The downloader contacts Hugging Face only when explicitly run; inference and app runtime are local and do not call cloud inference APIs. To work offline after setup, stage Python wheels/dependencies and the GGUF before disconnecting.
+
+## Setup (Linux)
+
+1. Install Python 3.11+ and the native CPU build tools (`build-essential` and `cmake` on Debian/Ubuntu). Create and activate a virtual environment:
+
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+2. Install dependencies with the CPU backend selected, download the model once, and start the local server:
+
+   ```bash
+   export CMAKE_ARGS="-DGGML_CUDA=OFF"
+   pip install -r requirements.txt
+   python scripts/download_model.py
+   uvicorn app.main:app --host 127.0.0.1 --port 8000
+   ```
+
+3. Open `http://127.0.0.1:8000`. Model download is setup-time network activity; inference makes no cloud API calls. Keep the GGUF and installed wheels available for subsequent offline runs.
 
 Optional environment settings:
 
@@ -66,12 +88,12 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 ## How processing works
 
 1. `POST /upload` accepts only `.log` and `.txt`, streams request data to disk in 1 MiB blocks, enforces the size limit while streaming, rejects empty/binary files with JSON errors, and returns a job ID. It does not keep a second whole-file copy in application memory.
-2. The parser reads line-by-line. Valid JSON objects are compacted to time, client IP, method, path, status, username, auth result, message, security rule, and a non-browser user agent; noisy host, response-bytes, and browser user-agent fields are omitted. Invalid JSON lines are treated as plain text. Every rendered entry retains its original 1-based line number.
-3. Entries are token-counted using `llama.tokenize` and packed whole into chunks of at most 900 log tokens. An individual entry larger than the chunk budget is rejected rather than split. Chunks and cumulative entity-ledger snapshots are checkpointed in SQLite.
-4. A persisted code-maintained ledger tracks those facts separately per client IP and username: failed/successful authentications, first/last line, distinct paths, status counts, and sensitive-path hit counts. Each chunk stores a compact, prioritized snapshot of facts from earlier chunks (at most 250 tokens); it contains no attack labels or conclusions, leaving attack classification to the model.
-5. Each call uses a 350-token system budget, 900 log-token budget, 250 ledger-token budget, and 500 output-token reserve. The prompt and reserve are re-counted before inference and must stay below 2,048 tokens. Calls are serialized, JSON-schema constrained, limited to 120 seconds, retried twice with backoff, and passed through a JSON repair fallback. Results are saved to SQLite immediately after successful calls; failed chunks record their error and the runner continues with later chunks.
-6. `POST /jobs/{job_id}/start` starts or resumes incomplete/failed chunks. `GET /jobs/{job_id}` reports status/progress/RAM/timing; `GET /api/jobs/{job_id}/progress` streams JSON events (`chunk`, elapsed seconds, RAM, call duration) via SSE; `GET /jobs/{job_id}/report` returns one merged final report, including successful chunks when some chunks failed. The report panel can download this final report as JSON. Completed chunk results survive process restarts. A running job is marked paused at startup and can be resumed by posting its job ID to the start endpoint.
-7. Findings are merged by entity and attack type, event-ID duplicate evidence is canonicalized, evidence line numbers are unioned, and severity takes the maximum. A model-produced brute-force finding is upgraded to account compromise when the IP ledger records at least three failures followed by a successful login. Routine operational errors remain excluded. Prompt-injection instructions in log data are separately identified as untrusted attempted injections.
+2. The parser streams the upload file line-by-line. Valid JSON objects are compacted to time, client IP, method, path, status, username, auth result, message, security rule, and a non-browser user agent; noisy host, response-bytes, and browser user-agent fields are omitted. Invalid JSON and non-object JSONL lines fall back to their original raw text. Every rendered record retains its original 1-based source line. `event_id`, when present, is retained as internal provenance, not added to model log text.
+3. The chunker counts the serialized entries with the loaded llama tokenizer. It greedily packs newline-joined complete entries into chunks of at most 900 tokens; it never splits an entry. An individual entry exceeding the chunk budget fails preparation with its source line rather than truncating it. Chunk input, ledger snapshot, token count, results, errors, and timings are stored in SQLite.
+4. A persisted code-maintained ledger tracks facts separately per client IP and username: failed/successful authentications, first/last source line, distinct paths, status counts, sensitive-path hits, and (for IPs) the successful-login line after at least three earlier failures. Each chunk receives a top-priority snapshot captured before that chunk starts, bounded to 250 model-tokenizer tokens. It is context only, with no attack labels or conclusions.
+5. The allocation is 350 system + 900 log + 250 ledger + 500 output-reserve tokens = 2,000, strictly below the 2,048 context. Before each call, the app asserts both that allocation and the actual rendered chat-template prompt plus output reserve fit. Calls are serialized, JSON-Schema constrained, limited to 120 seconds, retried twice with 1.5s/3s backoff, and parsed with a JSON repair fallback. Successful chunk findings are committed immediately. A chunk that exhausts retries records its error and the runner continues with the remaining chunks.
+6. `POST /jobs/{job_id}/start` starts or resumes incomplete/failed chunks, skipping completed chunks. `GET /jobs/{job_id}` reports progress/RAM/timing; `GET /api/jobs/{job_id}/progress` streams JSON events via SSE; `GET /jobs/{job_id}/report` returns the merged report, including completed chunks if another chunk failed. The report panel exports JSON. On restart, SQLite marks previously running jobs paused; successful chunks survive and the client can resume the same job.
+7. Findings are merged by `(entity, attack_type)`, event-ID duplicate line references are canonicalized to the earliest original line, evidence is unioned, and severity takes the maximum. A model-produced brute-force finding is upgraded to `account_compromise` when the IP ledger records at least three failures followed by a success. This is a deterministic sequence rule, not a hardcoded sample result. Routine operational errors are filtered from findings; analyzer-directed log instructions are identified as attempted prompt injection.
 
 ## API summary
 
