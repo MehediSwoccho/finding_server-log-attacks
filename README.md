@@ -125,3 +125,15 @@ Tests cover whole-entry chunk packing, original line references, oversized entri
 - Small CPU models can miss subtle attacks or produce false positives. The 2B Q4 model uses more memory than the 0.8B alternative; actual RAM use varies with the llama.cpp build and workload. Heuristics explicitly suppress common benign operational events and single login typos, but cannot eliminate every error.
 - Checkpoints and uploaded logs are stored locally without encryption. Protect the data directory and remove it when no longer needed. There is no authentication or multi-user isolation; bind to localhost.
 - GGUF chat-template and Qwen3.5 support depends on the selected llama.cpp/llama-cpp-python release and model conversion. Verify the chosen model on this machine before processing sensitive production logs.
+
+## Measured results (sample log, 258 lines)
+
+| Metric | Value |
+| --- | --- |
+| Model | Qwen3.5 0.8B Q4_K_M |
+| Model calls (chunks) | 22 |
+| Total analysis time | 470 s (about 21 s per call) |
+| Peak server RAM (RSS) | 909.9 MB |
+| Test machine | AMD Ryzen 7 5700U with Radeon Graphics, 7.3 GB RAM |
+
+Measured with `measure.py` against a running local server. Peak RAM is the server process memory sampled every 2 seconds.
