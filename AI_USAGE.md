@@ -8,7 +8,7 @@
 
 ## Key local-model prompt
 
-The system prompt tells the model that log data is untrusted, that embedded instructions must not be followed, and that only delimited evidence should be analyzed. It explicitly excludes routine application 500 errors, maintenance-window 503s, recovering database timeouts, registered health monitors, and a single login typo. It requires original 1-based evidence line numbers and JSON-only output. User content adds a cumulative entity-ledger summary and wraps the rendered entries in `<LOG_DATA>` delimiters. Closing delimiter-like text in log entries is escaped before prompting.
+The versioned `prompts/system.txt` tells the model that log data and ledger values are untrusted, that embedded instructions must not be followed, and that instruction-like log text is attempted prompt injection. It explicitly excludes routine application 500 errors, deployment/maintenance 503s, recovering database timeouts, registered health monitors, and a single login typo. It requires original 1-based evidence line numbers and JSON-only output. `prompts/findings.schema.json` constrains the response fields and severity to `Low`, `Medium`, `High`, or `Critical`. User content adds a cumulative entity-ledger summary and wraps the rendered entries in `<LOG_DATA>` delimiters. Closing delimiter-like text in log entries and ledger data is escaped before prompting.
 
 The output is constrained with a JSON schema containing only `findings`, whose entries require attack type, severity, entity, evidence lines, reason, and action. The service validates and normalizes results before checkpointing.
 
@@ -39,7 +39,7 @@ Before every call, the application counts actual prompt tokens using the loaded 
 - A broad “suspicious events” prompt can confuse an application bug or planned maintenance with malicious activity. The final prompt and post-processing suppress known benign classes.
 - Model output can omit, duplicate, or misformat line numbers. The schema requires evidence lines; the merger normalizes, deduplicates, and sorts integers while keeping 1-based source positions.
 - A small model may lose a sequence across chunks. Compact prior-chunk ledger snapshots provide IP- and username-linked event facts for the model's classification.
-- Model JSON can be incomplete despite constrained decoding. The repair fallback and required `findings` array check prevent malformed results from being treated as reports.
+- Model JSON can be incomplete despite constrained decoding. The repair fallback salvages only complete schema-shaped findings from truncated output, drops incomplete objects, and returns an empty findings list rather than raising on unrecoverable text.
 - Log messages may attempt to change the model's task. They are treated as data, and deterministic injection findings identify explicit analyzer-directed instructions.
 
 ## Review limits

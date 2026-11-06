@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "attack_type": { "type": "string" },
+          "severity": { "type": "string", "enum": ["Low", "Medium", "High", "Critical"] },
+          "entity": { "type": "string" },
+          "evidence_lines": { "type": "array", "items": { "type": "integer" } },
+          "reason": { "type": "string" },
+          "action": { "type": "string" }
+        },
+        "required": ["attack_type", "severity", "entity", "evidence_lines", "reason", "action"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["findings"],
+  "additionalProperties": false
+}
