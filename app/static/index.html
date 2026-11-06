@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0a1220">
+  <title>Local Security Log Analyzer</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Local Security Analyzer home"><span class="brand-mark">S</span><span>FIELDNOTES<span class="brand-sub">LOCAL SECURITY ANALYZER</span></span></a>
+      <div class="local-pill"><span class="pulse"></span> ON-DEVICE · OFFLINE</div>
+    </header>
+
+    <section class="intro">
+      <div class="eyebrow">INCIDENT REVIEW / 01</div>
+      <h1>Make the signal<br><em>visible.</em></h1>
+      <p class="lead">Triage security logs privately with a local model. Your files stay on this machine, and each completed chunk is checkpointed for safe resume.</p>
+    </section>
+
+    <section class="workspace" aria-label="Log analysis workspace">
+      <div class="panel upload-panel">
+        <div class="panel-heading"><div><span class="step">01</span><h2>Choose a log</h2></div><span class="format-note">.LOG / .TXT · UP TO 25 MB</span></div>
+        <label id="dropzone" class="dropzone" for="log-file">
+          <input id="log-file" type="file" accept=".log,.txt,text/plain" hidden>
+          <span class="upload-icon" aria-hidden="true">↑</span>
+          <strong id="file-label">Drop a file here, or <u>browse</u></strong>
+          <span class="muted">Files are processed locally and are not uploaded to a remote service.</span>
+        </label>
+        <div class="selected-file" id="selected-file" hidden></div>
+        <button id="start-button" class="primary-button" disabled>Analyze log <span aria-hidden="true">↗</span></button>
+        <div id="upload-error" class="error-message" role="alert" hidden></div>
+      </div>
+
+      <div class="panel progress-panel" id="progress-panel" hidden>
+        <div class="panel-heading"><div><span class="step">02</span><h2>Analysis progress</h2></div><span class="state-label" id="state-label">READY</span></div>
+        <div class="progress-meta"><span id="chunk-label">Waiting for analysis</span><span id="progress-percent">0%</span></div>
+        <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+        <div class="metrics">
+          <div class="metric"><span class="metric-label">PROCESS RAM</span><strong id="ram-value">—</strong><small id="ram-total">Live usage</small></div>
+          <div class="metric"><span class="metric-label">LAST MODEL CALL</span><strong id="timing-value">—</strong><small>Per-call duration</small></div>
+          <div class="metric"><span class="metric-label">CHECKPOINT</span><strong id="checkpoint-value">SQLite</strong><small>Resume enabled</small></div>
+        </div>
+        <div id="job-error" class="error-message" role="alert" hidden></div>
+      </div>
+
+      <section id="report-panel" class="panel report-panel" hidden>
+        <div class="panel-heading"><div><span class="step">03</span><h2>Final report</h2></div><span id="finding-count" class="format-note"></span></div>
+        <div class="table-wrap">
+          <table><thead><tr><th>SEVERITY</th><th>ATTACK TYPE</th><th>ENTITY</th><th>EVIDENCE LINES</th><th>REASON &amp; ACTION</th></tr></thead><tbody id="findings-body"></tbody></table>
+        </div>
+        <div id="empty-report" class="empty-report" hidden>No credible security findings were identified in this log.</div>
+      </section>
+    </section>
+    <footer><span>PRIVATE BY DESIGN</span><span>QWEN GGUF · CPU INFERENCE</span><span>NO CLOUD REQUESTS</span></footer>
+  </main>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
