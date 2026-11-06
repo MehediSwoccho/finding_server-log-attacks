@@ -7,6 +7,7 @@ const uploadError = document.querySelector('#upload-error');
 const progressPanel = document.querySelector('#progress-panel');
 const reportPanel = document.querySelector('#report-panel');
 const exportButton = document.querySelector('#export-button');
+const evidenceDetail = document.querySelector('#evidence-detail');
 let selected = null;
 let jobId = null;
 let progressSource = null;
@@ -28,6 +29,8 @@ function closeProgressStream() {
 function chooseFile(file) {
   clearError(uploadError);
   if (!file) return;
+  closeProgressStream();
+  evidenceDetail.hidden = true;
   if (jobId) {
     jobId = null;
     localStorage.removeItem('securityAnalyzerJobId');
@@ -45,6 +48,9 @@ function chooseFile(file) {
   selectedFile.hidden = false;
   startButton.disabled = false;
 }
+document.querySelector('#close-evidence').addEventListener('click', () => {
+  evidenceDetail.hidden = true;
+});
 
 fileInput.addEventListener('change', () => chooseFile(fileInput.files[0]));
 for (const eventName of ['dragenter', 'dragover']) {
@@ -181,6 +187,7 @@ async function showReport() {
   if (!response.ok) throw new Error(report.detail?.error || 'Could not load final report.');
   const body = document.querySelector('#findings-body');
   body.replaceChildren();
+  evidenceDetail.hidden = true;
   const findings = report.findings || [];
   document.querySelector('#finding-count').textContent = `${findings.length} FINDING${findings.length === 1 ? '' : 'S'}`;
   document.querySelector('#empty-report').hidden = findings.length > 0;
@@ -200,7 +207,20 @@ async function showReport() {
     entity.textContent = finding.entity;
     const evidence = document.createElement('td');
     evidence.className = 'evidence';
-    evidence.textContent = (finding.evidence_lines || []).map(line => `#${line}`).join(', ') || '—';
+    const evidenceLines = [...new Set(finding.evidence_lines || [])].filter(Number.isInteger).sort((a, b) => a - b);
+    if (evidenceLines.length) {
+      for (const lineNumber of evidenceLines) {
+        const lineButton = document.createElement('button');
+        lineButton.type = 'button';
+        lineButton.className = 'evidence-link';
+        lineButton.textContent = `#${lineNumber}`;
+        lineButton.setAttribute('aria-label', `View source log line ${lineNumber}`);
+        lineButton.addEventListener('click', () => showEvidenceLine(lineNumber));
+        evidence.append(lineButton);
+      }
+    } else {
+      evidence.textContent = '—';
+    }
     const detail = document.createElement('td');
     detail.className = 'reason';
     detail.textContent = finding.reason || '';
@@ -211,6 +231,21 @@ async function showReport() {
     }
     row.append(severity, attack, entity, evidence, detail);
     body.append(row);
+  }
+}
+
+async function showEvidenceLine(lineNumber) {
+  try {
+    const response = await fetch(`/jobs/${jobId}/lines/${lineNumber}`, { cache: 'no-store' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail?.error || 'Could not load this evidence line.');
+    document.querySelector('#evidence-title').textContent = `Original log line ${result.line_number}`;
+    document.querySelector('#evidence-source').textContent = result.source + (result.truncated ? '\n[Line preview truncated]' : '');
+    evidenceDetail.hidden = false;
+    evidenceDetail.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    clearError(document.querySelector('#job-error'));
+  } catch (error) {
+    showError(document.querySelector('#job-error'), error.message || 'Could not load this evidence line.');
   }
 }
 

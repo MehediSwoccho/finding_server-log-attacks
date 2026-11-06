@@ -52,6 +52,10 @@
         <div class="table-wrap">
           <table><thead><tr><th>SEVERITY</th><th>ATTACK TYPE</th><th>ENTITY</th><th>EVIDENCE LINES</th><th>REASON &amp; ACTION</th></tr></thead><tbody id="findings-body"></tbody></table>
         </div>
+        <aside id="evidence-detail" class="evidence-detail" aria-live="polite" hidden>
+          <div class="evidence-detail-heading"><strong id="evidence-title">Source evidence</strong><button id="close-evidence" class="evidence-close" type="button" aria-label="Close source evidence">×</button></div>
+          <pre id="evidence-source"></pre>
+        </aside>
         <div id="empty-report" class="empty-report" hidden>No credible security findings were identified in this log.</div>
       </section>
     </section>

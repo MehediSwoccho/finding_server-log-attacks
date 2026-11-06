@@ -79,6 +79,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 - `POST /jobs/{job_id}/start` — start or resume analysis.
 - `GET /jobs/{job_id}` — progress, last call duration, process RAM, and errors.
 - `GET /jobs/{job_id}/report` — final merged findings.
+- `GET /jobs/{job_id}/lines/{line_number}` — original uploaded source line for a clickable evidence reference.
 - `GET /health` — local service health.
 - `GET /api/health` — loaded model name, process RSS in MB, and most recent model-call latency in milliseconds (`null` before the first call).
 

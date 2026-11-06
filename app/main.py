@@ -143,6 +143,31 @@ def get_report(job_id: str) -> dict[str, Any]:
     return db.decode_json(job["report_json"], {"findings": []})
 
 
+@app.get("/jobs/{job_id}/lines/{line_number}")
+def get_log_line(job_id: str, line_number: int) -> dict[str, Any]:
+    if line_number < 1:
+        raise HTTPException(status_code=400, detail={"error": "Line numbers start at 1."})
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail={"error": "Job not found."})
+    log_path = Path(job["file_path"])
+    if not log_path.is_file():
+        raise HTTPException(status_code=404, detail={"error": "The uploaded log file is no longer available."})
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as source_file:
+            for current_line, source in enumerate(source_file, start=1):
+                if current_line == line_number:
+                    text = source.rstrip("\r\n")
+                    return {
+                        "line_number": line_number,
+                        "source": text[:4000],
+                        "truncated": len(text) > 4000,
+                    }
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail={"error": f"Could not read log line: {exc}"}) from exc
+    raise HTTPException(status_code=404, detail={"error": "Source line not found."})
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "mode": "local-only"}
