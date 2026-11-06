@@ -137,3 +137,13 @@ Tests cover whole-entry chunk packing, original line references, oversized entri
 | Test machine | AMD Ryzen 7 5700U with Radeon Graphics, 7.3 GB RAM |
 
 Measured with `measure.py` against a running local server. Peak RAM is the server process memory sampled every 2 seconds.
+
+## Screenshots
+
+Dashboard after a full run on the sample log (22 chunks, 430.5 s, 687.6 MB process RAM):
+
+![Dashboard](docs/dashboard.png)
+
+Final merged report from the same run:
+
+![Final report](docs/report.png)
