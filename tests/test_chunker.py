@@ -67,6 +67,12 @@ class LogParsingTests(unittest.TestCase):
         self.assertNotIn("response_bytes", fields)
         self.assertIn('"line":9', rendered)
 
+        event_fields, event_rendering = parse_log_line(
+            '{"event_id":"event-duplicate","message":"request"}', 11
+        )
+        self.assertEqual(event_fields["event_id"], "event-duplicate")
+        self.assertNotIn("event-duplicate", event_rendering)
+
         browser_fields, _ = parse_log_line(
             '{"user_agent":"Mozilla/5.0 Chrome/130.0.0.0","message":"ok"}', 10
         )
@@ -178,6 +184,60 @@ class PrepareJobChunkingTests(unittest.TestCase):
                     json.loads(row["distinct_paths_json"]), ["/api/login", "/reports"]
                 )
                 self.assertEqual(json.loads(row["status_counts_json"]), {"401": 1, "200": 1})
+
+    def test_event_ids_are_persisted_with_original_source_lines(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            contents = (
+                '{"event_id":"evt-1","client_ip":"192.0.2.31","auth_result":"failed","path":"/login","status":401,"message":"first"}\n'
+                '{"event_id":"evt-1","client_ip":"192.0.2.31","auth_result":"failed","path":"/login","status":401,"message":"duplicate"}\n'
+            )
+            job_id, log_path, database_path = self._create_job(root, contents)
+
+            with patch.object(db, "DB_PATH", database_path):
+                db.initialize_database()
+                db.create_job(job_id, log_path.name, str(log_path))
+                prepare_job(job_id, len)
+                with db.connect() as connection:
+                    rows = connection.execute(
+                        "SELECT event_id, line_number FROM event_id_lines WHERE job_id = ? ORDER BY line_number",
+                        (job_id,),
+                    ).fetchall()
+                    ledger = connection.execute(
+                        "SELECT * FROM entity_ledger_items WHERE job_id = ? AND entity_type = 'client_ip'",
+                        (job_id,),
+                    ).fetchone()
+
+            self.assertEqual([(row["event_id"], row["line_number"]) for row in rows], [("evt-1", 1), ("evt-1", 2)])
+            self.assertEqual(ledger["failed_login_count"], 1)
+            self.assertEqual(ledger["last_line"], 1)
+            self.assertEqual(json.loads(ledger["status_counts_json"]), {"401": 1})
+
+    def test_ip_ledger_records_success_line_after_repeated_failures(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            events = [
+                {"client_ip": "192.0.2.77", "auth_result": "failed", "path": "/login", "status": 401},
+                {"client_ip": "192.0.2.77", "auth_result": "failed", "path": "/login", "status": 401},
+                {"client_ip": "192.0.2.77", "auth_result": "failed", "path": "/login", "status": 401},
+                {"client_ip": "192.0.2.77", "auth_result": "success", "path": "/login", "status": 200},
+            ]
+            contents = "\n".join(json.dumps(event) for event in events) + "\n"
+            job_id, log_path, database_path = self._create_job(root, contents)
+
+            with patch.object(db, "DB_PATH", database_path):
+                db.initialize_database()
+                db.create_job(job_id, log_path.name, str(log_path))
+                prepare_job(job_id, len)
+                with db.connect() as connection:
+                    ledger = connection.execute(
+                        "SELECT * FROM entity_ledger_items WHERE job_id = ? AND entity_type = 'client_ip'",
+                        (job_id,),
+                    ).fetchone()
+
+            self.assertEqual(ledger["failed_login_count"], 3)
+            self.assertEqual(ledger["successful_login_count"], 1)
+            self.assertEqual(ledger["success_after_repeated_failures_line"], 4)
 
 
 if __name__ == "__main__":

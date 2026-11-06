@@ -18,7 +18,7 @@ The output is constrained with a JSON schema containing only `findings`, whose e
 2. Untrusted-data language and explicit log delimiters were added after identifying that attacker-controlled log messages may contain prompt-like instructions.
 3. A deterministic pre-scan was added for lines containing instructions aimed at the analyzer. Those lines become `prompt_injection` findings without executing or quoting their instructions.
 4. Cross-chunk context was moved into a persisted code-maintained ledger keyed by client IP and username rather than relying on model memory. Its snapshots contain event facts only (login counts, lines, paths, status counts, sensitive-path hits), not attack labels or model-generated conclusions.
-5. Findings are merged in application code. Evidence is unioned and severity maximized; entity-ledger data remains factual context and the model owns attack classification.
+5. Findings are merged in application code. Duplicate event IDs map to one canonical evidence line; other evidence is unioned and severity maximized. A model-produced brute-force finding is upgraded to account compromise only when the IP ledger records at least three failures followed by a successful login.
 6. Constrained JSON output is still parsed defensively, with a repair fallback and schema-shape validation.
 
 ## Token and runtime budget
@@ -38,7 +38,7 @@ Before every call, the application counts actual prompt tokens using the loaded 
 
 - A broad “suspicious events” prompt can confuse an application bug or planned maintenance with malicious activity. The final prompt and post-processing suppress known benign classes.
 - Model output can omit, duplicate, or misformat line numbers. The schema requires evidence lines; the merger normalizes, deduplicates, and sorts integers while keeping 1-based source positions.
-- A small model may lose a sequence across chunks. Compact prior-chunk ledger snapshots provide IP- and username-linked event facts for the model's classification.
+- A small model may lose a sequence across chunks. Compact prior-chunk ledger snapshots provide IP- and username-linked event facts; the merger also uses the recorded IP login sequence to apply the explicit account-compromise upgrade rule.
 - Model JSON can be incomplete despite constrained decoding. The repair fallback salvages only complete schema-shaped findings from truncated output, drops incomplete objects, and returns an empty findings list rather than raising on unrecoverable text.
 - Log messages may attempt to change the model's task. They are treated as data, and deterministic injection findings identify explicit analyzer-directed instructions.
 

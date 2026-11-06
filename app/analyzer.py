@@ -35,6 +35,7 @@ SENSITIVE_PATH = re.compile(r"(?:admin|login|auth|password|token|secret|backup|c
 ATTACK_MARKERS = re.compile(r"(?:sql.?injection|traversal|brute.?force|credential.?stuff|exploit|malware|command.?injection|unauthorized|attack|blocked)", re.I)
 SEVERITY_ORDER = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 FIELD_ALIASES = {
+    "event_id": {"event_id", "eventid"},
     "time": {"time", "timestamp", "@timestamp", "datetime", "date"},
     "client_ip": {"ip", "client_ip", "clientip", "src_ip", "source_ip", "remote_addr", "remote_ip"},
     "method": {"method", "http_method", "request_method"},
@@ -145,9 +146,13 @@ def parse_log_line(raw_line: str, line_number: int) -> tuple[dict[str, Any], str
             if canonical == "user_agent" and BROWSER_UA.search(str(value)):
                 continue
             compact.setdefault(canonical, value)
-        data = compact or {"message": raw_line.strip()}
+        data = compact
+        if not any(key != "event_id" for key in data):
+            data["message"] = raw_line.strip()
+    # Keep event IDs as internal deduplication metadata, not model prompt content.
+    rendered_data = {key: value for key, value in data.items() if key != "event_id"}
     # Escape user-controlled closing tags before wrapping the log block in the prompt.
-    rendered = json.dumps({"line": line_number, "data": data}, ensure_ascii=False, separators=(",", ":"))
+    rendered = json.dumps({"line": line_number, "data": rendered_data}, ensure_ascii=False, separators=(",", ":"))
     rendered = rendered.replace("</LOG_DATA", "\\u003c/LOG_DATA")
     return data, rendered
 
@@ -209,22 +214,44 @@ def _record_entity(connection: sqlite3.Connection, job_id: str, line: int, field
             statuses[status] = statuses.get(status, 0) + 1
         failed = prior["failed_login_count"] if prior else 0
         successful = prior["successful_login_count"] if prior else 0
+        success_after_failures_line = prior["success_after_repeated_failures_line"] if prior else None
         if outcome == "failed":
             failed += 1
         elif outcome == "success":
             successful += 1
+            if entity_type == "client_ip" and failed >= 3 and success_after_failures_line is None:
+                success_after_failures_line = line
         connection.execute(
             """INSERT OR REPLACE INTO entity_ledger_items
             (job_id, entity_type, entity_value, failed_login_count, successful_login_count,
-             first_line, last_line, distinct_paths_json, status_counts_json, sensitive_path_hits)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             first_line, last_line, distinct_paths_json, status_counts_json, sensitive_path_hits,
+             success_after_repeated_failures_line)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 job_id, entity_type, entity_value, failed, successful,
                 prior["first_line"] if prior else line, line,
                 json.dumps(paths, ensure_ascii=False), json.dumps(statuses, ensure_ascii=False),
                 (prior["sensitive_path_hits"] if prior else 0) + int(sensitive_hit),
+                success_after_failures_line,
             ),
         )
+
+
+def _record_event_id(connection: sqlite3.Connection, job_id: str, line: int, fields: dict[str, Any]) -> bool:
+    """Record an event ID and return whether the event appeared on an earlier line."""
+    event_id = fields.get("event_id")
+    if event_id is None or not str(event_id).strip():
+        return False
+    normalized_id = str(event_id).strip()[:200]
+    duplicate = connection.execute(
+        "SELECT 1 FROM event_id_lines WHERE job_id = ? AND event_id = ? LIMIT 1",
+        (job_id, normalized_id),
+    ).fetchone() is not None
+    connection.execute(
+        "INSERT OR IGNORE INTO event_id_lines(job_id, event_id, line_number) VALUES (?, ?, ?)",
+        (job_id, normalized_id, line),
+    )
+    return duplicate
 
 
 def _ledger_snapshot(connection: sqlite3.Connection, job_id: str, token_counter: Callable[[str], int]) -> str:
@@ -297,6 +324,7 @@ def prepare_job(job_id: str, token_counter: Callable[[str], int]) -> int:
         connection.execute("DELETE FROM chunks WHERE job_id = ?", (job_id,))
         connection.execute("DELETE FROM entity_ledger WHERE job_id = ?", (job_id,))
         connection.execute("DELETE FROM entity_ledger_items WHERE job_id = ?", (job_id,))
+        connection.execute("DELETE FROM event_id_lines WHERE job_id = ?", (job_id,))
         connection.execute("DELETE FROM rule_findings WHERE job_id = ?", (job_id,))
         connection.execute("DELETE FROM benign_lines WHERE job_id = ?", (job_id,))
         chunker = EntryChunker(token_counter, MAX_LOG_TOKENS)
@@ -313,7 +341,9 @@ def prepare_job(job_id: str, token_counter: Callable[[str], int]) -> int:
                     _flush_chunk(connection, job_id, chunk_index, completed[0], completed[1], chunk_ledger_text)
                     chunk_index += 1
                     chunk_ledger_text = _ledger_snapshot(connection, job_id, token_counter)
-                _record_entity(connection, job_id, line_number, fields)
+                duplicate_event = _record_event_id(connection, job_id, line_number, fields)
+                if not duplicate_event:
+                    _record_entity(connection, job_id, line_number, fields)
                 if _is_prompt_injection(raw_line):
                     entity = str(fields.get("client_ip") or f"line:{line_number}")
                     connection.execute(
@@ -591,13 +621,30 @@ def _merge_report(job_id: str) -> dict[str, Any]:
         chunk_rows = connection.execute(
             "SELECT result_json FROM chunks WHERE job_id = ? AND status = 'completed' ORDER BY chunk_index", (job_id,)
         ).fetchall()
+        ledger_rows = connection.execute(
+            "SELECT * FROM entity_ledger_items WHERE job_id = ? AND entity_type = 'client_ip'",
+            (job_id,),
+        ).fetchall()
+        event_rows = connection.execute(
+            "SELECT event_id, line_number FROM event_id_lines WHERE job_id = ? ORDER BY event_id, line_number",
+            (job_id,),
+        ).fetchall()
         rule_rows = connection.execute("SELECT * FROM rule_findings WHERE job_id = ?", (job_id,)).fetchall()
         benign_rows = connection.execute("SELECT line_number FROM benign_lines WHERE job_id = ?", (job_id,)).fetchall()
     benign_lines = {row["line_number"] for row in benign_rows}
+    ip_ledger = {row["entity_value"]: row for row in ledger_rows}
+    event_id_line_groups: dict[str, list[int]] = {}
+    for row in event_rows:
+        event_id_line_groups.setdefault(row["event_id"], []).append(row["line_number"])
+    canonical_event_lines = {
+        line: min(lines)
+        for lines in event_id_line_groups.values()
+        for line in lines
+    }
     merged: dict[tuple[str, str], dict[str, Any]] = {}
 
     def add(finding: dict[str, Any]) -> None:
-        evidence = sorted(set(finding["evidence_lines"]))
+        evidence = sorted({canonical_event_lines.get(line, line) for line in finding["evidence_lines"]})
         if not evidence:
             return
         # Exclude findings supported solely by known routine operational events.
@@ -605,6 +652,21 @@ def _merge_report(job_id: str) -> dict[str, Any]:
             return
         attack = finding["attack_type"].lower().replace(" ", "_")
         entity = finding["entity"]
+        facts = ip_ledger.get(entity)
+        if (
+            facts is not None
+            and "brute" in attack
+            and "force" in attack
+            and facts["failed_login_count"] >= 3
+            and facts["success_after_repeated_failures_line"] is not None
+        ):
+            attack = "account_compromise"
+            success_line = facts["success_after_repeated_failures_line"]
+            evidence = sorted(set(evidence) | {canonical_event_lines.get(success_line, success_line)})
+            finding["reason"] = (
+                finding["reason"]
+                + " The same IP later logged in successfully after at least three failures."
+            ).strip()
         key = (entity, attack)
         current = merged.get(key)
         if current is None:

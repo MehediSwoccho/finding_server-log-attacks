@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#0a1220">
   <title>Local Security Log Analyzer</title>
   <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/report-export.css">
 </head>
 <body>
   <main class="shell">
@@ -47,7 +48,7 @@
       </div>
 
       <section id="report-panel" class="panel report-panel" hidden>
-        <div class="panel-heading"><div><span class="step">03</span><h2>Final report</h2></div><span id="finding-count" class="format-note"></span></div>
+        <div class="panel-heading"><div><span class="step">03</span><h2>Final report</h2></div><div class="report-actions"><span id="finding-count" class="format-note"></span><button id="export-button" class="secondary-button" type="button">Download JSON ↓</button></div></div>
         <div class="table-wrap">
           <table><thead><tr><th>SEVERITY</th><th>ATTACK TYPE</th><th>ENTITY</th><th>EVIDENCE LINES</th><th>REASON &amp; ACTION</th></tr></thead><tbody id="findings-body"></tbody></table>
         </div>

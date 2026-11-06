@@ -6,6 +6,7 @@ const startButton = document.querySelector('#start-button');
 const uploadError = document.querySelector('#upload-error');
 const progressPanel = document.querySelector('#progress-panel');
 const reportPanel = document.querySelector('#report-panel');
+const exportButton = document.querySelector('#export-button');
 let selected = null;
 let jobId = null;
 let progressSource = null;
@@ -53,6 +54,26 @@ for (const eventName of ['dragleave', 'drop']) {
   dropzone.addEventListener(eventName, event => { event.preventDefault(); dropzone.classList.remove('drag-over'); });
 }
 dropzone.addEventListener('drop', event => chooseFile(event.dataTransfer.files[0]));
+
+exportButton.addEventListener('click', async () => {
+  if (!jobId) return;
+  try {
+    const response = await fetch(`/jobs/${jobId}/report`, { cache: 'no-store' });
+    const report = await response.json();
+    if (!response.ok) throw new Error(report.detail?.error || 'Could not export the report.');
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `security-report-${jobId}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    showError(document.querySelector('#job-error'), error.message || 'JSON export failed.');
+  }
+});
 
 startButton.addEventListener('click', async () => {
   if (!selected && !jobId) return;

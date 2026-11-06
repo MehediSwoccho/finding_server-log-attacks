@@ -82,7 +82,14 @@ def initialize_database() -> None:
                 distinct_paths_json TEXT NOT NULL DEFAULT '[]',
                 status_counts_json TEXT NOT NULL DEFAULT '{}',
                 sensitive_path_hits INTEGER NOT NULL DEFAULT 0,
+                success_after_repeated_failures_line INTEGER,
                 PRIMARY KEY (job_id, entity_type, entity_value)
+            );
+            CREATE TABLE IF NOT EXISTS event_id_lines (
+                job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                event_id TEXT NOT NULL,
+                line_number INTEGER NOT NULL,
+                PRIMARY KEY (job_id, event_id, line_number)
             );
             CREATE TABLE IF NOT EXISTS rule_findings (
                 job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -104,6 +111,12 @@ def initialize_database() -> None:
         )
         _ensure_column(connection, "jobs", "started_at", "TEXT")
         _ensure_column(connection, "chunks", "call_started_at", "TEXT")
+        _ensure_column(
+            connection,
+            "entity_ledger_items",
+            "success_after_repeated_failures_line",
+            "INTEGER",
+        )
         connection.execute(
             "UPDATE jobs SET status = 'paused', updated_at = ? WHERE status = 'running'",
             (now_iso(),),
